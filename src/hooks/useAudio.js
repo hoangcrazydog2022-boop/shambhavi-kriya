@@ -1,5 +1,11 @@
 import { useRef, useCallback } from 'react';
 
+// Shared Web Audio API Context and decoded audio buffer cache
+let globalAudioContext = null;
+let globalBellBuffer = null;
+const audioBufferCache = new Map();
+let globalAudioElement = null;
+
 // Synthesize a meditation bell sound using Web Audio API
 function createBellSound(audioContext) {
   const duration = 2.5;
@@ -29,28 +35,56 @@ function createBellSound(audioContext) {
   return buffer;
 }
 
-export function useAudio() {
-  const audioRef = useRef(null);
-  const audioContextRef = useRef(null);
-  const bellBufferRef = useRef(null);
-  const activeResolveRef = useRef(null);
-
-  // Initialize audio context
-  const init = useCallback(() => {
-    try {
-      if (!audioContextRef.current) {
-        const AudioCtx = window.AudioContext || window.webkitAudioContext;
-        if (AudioCtx) {
-          audioContextRef.current = new AudioCtx();
-          bellBufferRef.current = createBellSound(audioContextRef.current);
-        }
+// Unlock audio synchronously during user gesture on iOS/Desktop
+export function unlockAudioOnIOS() {
+  try {
+    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+    if (AudioCtx) {
+      if (!globalAudioContext) {
+        globalAudioContext = new AudioCtx();
+        globalBellBuffer = createBellSound(globalAudioContext);
       }
-      if (audioContextRef.current && audioContextRef.current.state === 'suspended') {
-        audioContextRef.current.resume();
+      if (globalAudioContext.state === 'suspended') {
+        globalAudioContext.resume();
       }
-    } catch (e) {
-      console.warn('AudioContext init error:', e);
     }
+
+    if (!globalAudioElement) {
+      globalAudioElement = new Audio();
+    }
+    // Attempt silent unlock
+    globalAudioElement.play().then(() => {
+      globalAudioElement.pause();
+    }).catch(() => {});
+  } catch (e) {
+    console.warn('iOS audio unlock error:', e);
+  }
+}
+
+// Helper to fetch & decode audio file into WebAudio AudioBuffer
+async function loadAudioBuffer(src) {
+  if (audioBufferCache.has(src)) {
+    return audioBufferCache.get(src);
+  }
+  try {
+    const response = await fetch(src);
+    const arrayBuffer = await response.arrayBuffer();
+    const AudioCtx = globalAudioContext || new (window.AudioContext || window.webkitAudioContext)();
+    const decoded = await AudioCtx.decodeAudioData(arrayBuffer);
+    audioBufferCache.set(src, decoded);
+    return decoded;
+  } catch (e) {
+    console.warn('Failed to decode audio via WebAudio:', src, e);
+    return null;
+  }
+}
+
+export function useAudio() {
+  const activeResolveRef = useRef(null);
+  const activeSourceRef = useRef(null);
+
+  const init = useCallback(() => {
+    unlockAudioOnIOS();
   }, []);
 
   const stopAll = useCallback(() => {
@@ -59,26 +93,36 @@ export function useAudio() {
       activeResolveRef.current = null;
       resolve();
     }
-    if (audioRef.current) {
+    if (activeSourceRef.current) {
       try {
-        audioRef.current.pause();
-        audioRef.current.currentTime = 0;
+        activeSourceRef.current.stop();
+        activeSourceRef.current.disconnect();
       } catch (e) {}
-      audioRef.current = null;
+      activeSourceRef.current = null;
+    }
+    if (globalAudioElement) {
+      try {
+        globalAudioElement.pause();
+        globalAudioElement.currentTime = 0;
+      } catch (e) {}
     }
   }, []);
 
   const playBell = useCallback(() => {
     return new Promise((resolve) => {
       try {
-        init();
-        const ctx = audioContextRef.current;
-        if (!ctx || !bellBufferRef.current) {
+        unlockAudioOnIOS();
+        const ctx = globalAudioContext;
+        if (!ctx || !globalBellBuffer) {
           setTimeout(resolve, 1000);
           return;
         }
+        if (ctx.state === 'suspended') {
+          ctx.resume();
+        }
+
         const source = ctx.createBufferSource();
-        source.buffer = bellBufferRef.current;
+        source.buffer = globalBellBuffer;
         source.connect(ctx.destination);
 
         let doneCalled = false;
@@ -97,16 +141,12 @@ export function useAudio() {
         resolve();
       }
     });
-  }, [init]);
+  }, []);
 
   const playAudio = useCallback((src) => {
-    return new Promise((resolve) => {
-      // Stop any currently playing audio first and resolve pending promise
+    return new Promise(async (resolve) => {
       stopAll();
-      init();
-
-      const audio = new Audio(src);
-      audioRef.current = audio;
+      unlockAudioOnIOS();
 
       let doneCalled = false;
       let safetyTimeout = null;
@@ -115,37 +155,68 @@ export function useAudio() {
         if (!doneCalled) {
           doneCalled = true;
           activeResolveRef.current = null;
+          activeSourceRef.current = null;
           if (safetyTimeout) clearTimeout(safetyTimeout);
-          audio.removeEventListener('ended', done);
-          audio.removeEventListener('error', done);
-          try {
-            audio.pause();
-          } catch (e) {}
           resolve();
         }
       };
 
       activeResolveRef.current = done;
 
-      audio.addEventListener('ended', done);
-      audio.addEventListener('error', (e) => {
-        console.warn('Audio error on:', src, e);
-        done();
-      });
+      // Primary Method: Web Audio API BufferSource (100% immune to iOS WebKit re-locking!)
+      try {
+        const ctx = globalAudioContext;
+        if (ctx && ctx.state === 'suspended') {
+          await ctx.resume();
+        }
 
-      // Safety timeout: fallback if metadata loads or fails
-      audio.addEventListener('loadedmetadata', () => {
-        const timeoutMs = (audio.duration || 10) * 1000 + 2000;
-        safetyTimeout = setTimeout(done, Math.max(3000, timeoutMs));
-      });
-      safetyTimeout = setTimeout(done, 15000);
+        const buffer = await loadAudioBuffer(src);
+        if (buffer && ctx && ctx.state === 'running') {
+          const source = ctx.createBufferSource();
+          source.buffer = buffer;
+          source.connect(ctx.destination);
+          activeSourceRef.current = source;
+          source.onended = done;
 
-      audio.play().catch((e) => {
-        console.warn('Audio play blocked/failed for:', src, e);
+          const timeoutMs = (buffer.duration || 10) * 1000 + 2000;
+          safetyTimeout = setTimeout(done, Math.max(3000, timeoutMs));
+
+          source.start(0);
+          return;
+        }
+      } catch (e) {
+        console.warn('WebAudio buffer play failed, falling back to HTML5 Audio:', src, e);
+      }
+
+      // Fallback Method: HTML5 Audio Element
+      try {
+        const audio = globalAudioElement || new Audio();
+        globalAudioElement = audio;
+
+        audio.pause();
+        audio.src = src;
+        try { audio.load(); } catch (e) {}
+        audio.currentTime = 0;
+
+        audio.addEventListener('ended', done);
+        audio.addEventListener('error', done);
+
+        audio.addEventListener('loadedmetadata', () => {
+          const timeoutMs = (audio.duration || 10) * 1000 + 2000;
+          safetyTimeout = setTimeout(done, Math.max(3000, timeoutMs));
+        });
+        safetyTimeout = setTimeout(done, 15000);
+
+        audio.play().catch((e) => {
+          console.warn('HTML5 Audio play failed:', src, e);
+          done();
+        });
+      } catch (e) {
+        console.warn('HTML5 Audio fallback failed:', src, e);
         done();
-      });
+      }
     });
-  }, [init, stopAll]);
+  }, [stopAll]);
 
   const getAudioDuration = useCallback((src) => {
     return new Promise((resolve) => {
@@ -156,16 +227,12 @@ export function useAudio() {
   }, []);
 
   const pauseAll = useCallback(() => {
-    if (audioRef.current) {
-      try {
-        audioRef.current.pause();
-      } catch (e) {}
-    }
-  }, []);
+    stopAll();
+  }, [stopAll]);
 
   const resumeAll = useCallback(() => {
-    if (audioRef.current && audioRef.current.paused && audioRef.current.currentTime > 0) {
-      audioRef.current.play().catch(() => {});
+    if (globalAudioContext && globalAudioContext.state === 'suspended') {
+      globalAudioContext.resume().catch(() => {});
     }
   }, []);
 
